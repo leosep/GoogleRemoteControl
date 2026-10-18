@@ -11,14 +11,19 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.math.BigInteger
+import java.net.Inet4Address
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.Socket
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.cert.X509Certificate
 import java.security.interfaces.RSAPublicKey
 import java.util.Date
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.*
 
 /** Minimal hand-written protobuf (only what is needed). */
@@ -86,6 +91,7 @@ class TvRemote(private val ctx: Context) {
     var onStatus: (String) -> Unit = {}
     @Volatile private var sock: SSLSocket? = null
     @Volatile private var gen = 0
+    @Volatile private var scanGen = 0
     private var discovery: NsdManager? = null
     private var listener: NsdManager.DiscoveryListener? = null
     private val ex = Executors.newSingleThreadExecutor()
@@ -115,9 +121,33 @@ class TvRemote(private val ctx: Context) {
             override fun getAcceptedIssuers() = arrayOf<X509Certificate>()
         }
         val sc = SSLContext.getInstance("TLS").apply { init(kmf.keyManagers, arrayOf(trustAll), null) }
-        return (sc.socketFactory.createSocket() as SSLSocket).apply {
-            connect(InetSocketAddress(host, port), 5000); soTimeout = 0; startHandshake()
+        fun open(protocols: Array<String>?): SSLSocket {
+            val s = sc.socketFactory.createSocket() as SSLSocket
+            if (protocols != null) s.enabledProtocols = protocols
+            s.connect(InetSocketAddress(host, port), 5000)
+            s.soTimeout = 0
+            return s
         }
+        // The Android TV Remote Service only speaks TLS 1.2, but fall back to the platform default if needed.
+        val s = open(arrayOf("TLSv1.2"))
+        try {
+            s.startHandshake()
+            return s
+        } catch (e: SSLException) {
+            try { s.close() } catch (_: Exception) {}
+            val s2 = open(null)
+            s2.startHandshake()
+            return s2
+        }
+    }
+
+    /** Turns low-level network/SSL exceptions into messages a user can act on. */
+    fun friendlyError(e: Throwable): String = when {
+        e is SSLException -> "Secure handshake failed. Pair with the TV first (tap Pair) and try again."
+        e is java.net.SocketTimeoutException -> "Connection timed out. Check the TV is on and on the same Wi-Fi."
+        e is java.net.ConnectException -> "Could not reach the TV at that address."
+        e is java.net.UnknownHostException -> "Unknown address."
+        else -> e.message ?: "Connection failed"
     }
 
     private fun mod(n: BigInteger): ByteArray { val a = n.toByteArray(); return if (a[0] == 0.toByte()) a.copyOfRange(1, a.size) else a }
@@ -170,7 +200,7 @@ class TvRemote(private val ctx: Context) {
                     }
                 }
             } catch (e: Exception) {
-                if (my == gen) onStatus("Disconnected: ${e.message ?: "connection failed"}")
+                if (my == gen) onStatus("Disconnected: ${friendlyError(e)}")
             }
         }.start()
     }
@@ -188,18 +218,37 @@ class TvRemote(private val ctx: Context) {
     fun type(t: String) = t.forEach { c -> K.forChar(c)?.let { key(it) } }
     fun openLink(url: String) = send(Pb.bytes(90, Pb.str(1, url)))
 
-    fun discover(cb: (String, String) -> Unit) {
+    /**
+     * Discovers TVs on the local network in two ways:
+     *  - mDNS/NSD lookup of `_androidtvremote2._tcp`
+     *  - a parallel TCP scan of the local /24 subnet on port 6466
+     * [onDevice] is called for every device found, [onDone] once the subnet scan finishes.
+     */
+    fun discover(onDevice: (String, String) -> Unit, onDone: () -> Unit) {
         stopDiscovery()
+        val g = ++scanGen
+        startNsd(g, onDevice)
+        Thread {
+            scanSubnet(g, onDevice)
+            if (g == scanGen) onDone()
+        }.start()
+    }
+
+    private fun startNsd(g: Int, onDevice: (String, String) -> Unit) {
         val nsd = ctx.getSystemService(Context.NSD_SERVICE) as NsdManager
         discovery = nsd
         val l = object : NsdManager.DiscoveryListener {
             override fun onServiceFound(s: NsdServiceInfo) {
-                nsd.resolveService(s, object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(i: NsdServiceInfo, e: Int) {}
-                    override fun onServiceResolved(i: NsdServiceInfo) {
-                        i.host?.hostAddress?.let { cb(i.serviceName, it) }
-                    }
-                })
+                try {
+                    nsd.resolveService(s, object : NsdManager.ResolveListener {
+                        override fun onResolveFailed(i: NsdServiceInfo, e: Int) {}
+                        @Suppress("DEPRECATION")
+                        override fun onServiceResolved(i: NsdServiceInfo) {
+                            val addr = i.host?.hostAddress ?: return
+                            if (g == scanGen) onDevice(i.serviceName, addr)
+                        }
+                    })
+                } catch (_: Exception) {}
             }
             override fun onStartDiscoveryFailed(t: String, e: Int) {}
             override fun onStopDiscoveryFailed(t: String, e: Int) {}
@@ -211,7 +260,40 @@ class TvRemote(private val ctx: Context) {
         try { nsd.discoverServices("_androidtvremote2._tcp", NsdManager.PROTOCOL_DNS_SD, l) } catch (_: Exception) {}
     }
 
+    private fun localIpv4(): String? {
+        try {
+            for (ni in NetworkInterface.getNetworkInterfaces()) {
+                if (!ni.isUp || ni.isLoopback) continue
+                for (ia in ni.inetAddresses) {
+                    if (ia is Inet4Address && !ia.isLoopbackAddress && ia.isSiteLocalAddress) return ia.hostAddress
+                }
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    private fun scanSubnet(g: Int, onDevice: (String, String) -> Unit) {
+        val own = localIpv4() ?: return
+        val base = own.substringBeforeLast('.')
+        val pool = Executors.newFixedThreadPool(48)
+        val latch = CountDownLatch(254)
+        for (i in 1..254) {
+            val target = "$base.$i"
+            pool.execute {
+                try {
+                    if (target != own && g == scanGen) {
+                        Socket().use { it.connect(InetSocketAddress(target, 6466), 400) }
+                        if (g == scanGen) onDevice("Android TV", target)
+                    }
+                } catch (_: Exception) {} finally { latch.countDown() }
+            }
+        }
+        latch.await(20, TimeUnit.SECONDS)
+        pool.shutdownNow()
+    }
+
     fun stopDiscovery() {
+        scanGen++
         try { listener?.let { discovery?.stopServiceDiscovery(it) } } catch (_: Exception) {}
         listener = null
     }

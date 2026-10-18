@@ -9,6 +9,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import java.util.concurrent.CompletableFuture
@@ -35,19 +36,61 @@ fun App(r: TvRemote, act: Activity) {
     var fut by remember { mutableStateOf<CompletableFuture<String>?>(null) }
     var code by remember { mutableStateOf("") }
     var text by remember { mutableStateOf("") }
+    var scanning by remember { mutableStateOf(false) }
     val found = remember { mutableStateListOf<Pair<String, String>>() }
     fun ui(b: () -> Unit) = act.runOnUiThread(b)
 
+    fun startScan() {
+        found.clear()
+        scanning = true
+        r.discover({ n, h -> ui { if (found.none { it.second == h }) found.add(n to h) } }) { ui { scanning = false } }
+    }
+
     LaunchedEffect(Unit) {
         r.onStatus = { s -> ui { status = s } }
-        r.discover { n, h -> ui { if (found.none { it.second == h }) found.add(n to h) } }
+        startScan()
         if (host.isNotBlank()) r.connect(host)
     }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).statusBarsPadding().padding(12.dp)) {
         Text(status, style = MaterialTheme.typography.labelLarge)
-        OutlinedTextField(host, { host = it }, label = { Text("TV IP address") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-        found.forEach { (n, h) -> TextButton({ host = h }) { Text("$n  ($h)") } }
+        Spacer(Modifier.height(8.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Devices on your network", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            TextButton({ startScan() }) { Text("Rescan") }
+        }
+        if (scanning) Row(verticalAlignment = Alignment.CenterVertically) {
+            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+            Spacer(Modifier.width(8.dp))
+            Text("Searching…", style = MaterialTheme.typography.bodySmall)
+        }
+        if (!scanning && found.isEmpty())
+            Text(
+                "No devices yet. Make sure the TV is on and on the same Wi-Fi, then tap Rescan.",
+                style = MaterialTheme.typography.bodySmall
+            )
+        found.forEach { (n, h) ->
+            val selected = h == host
+            Card(
+                onClick = { host = h },
+                modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(n, style = MaterialTheme.typography.bodyLarge)
+                        Text(h, style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (selected) Text("Selected", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(host, { host = it }, label = { Text("TV IP address (or pick above)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         Row {
             Button({ if (host.isNotBlank()) { prefs.edit().putString("host", host).apply(); r.connect(host) } }, Modifier.weight(1f).padding(3.dp)) { Text("Connect") }
             OutlinedButton({
@@ -56,7 +99,7 @@ fun App(r: TvRemote, act: Activity) {
                         r.pair(host, { val f = CompletableFuture<String>(); ui { fut = f }; f.get() }) { s -> ui { status = s } }
                         ui { fut = null; prefs.edit().putString("host", host).apply() }
                         r.connect(host)
-                    } catch (e: Exception) { ui { fut = null; status = "Error: ${e.message}" } }
+                    } catch (e: Exception) { ui { fut = null; status = "Error: ${r.friendlyError(e)}" } }
                 }.start()
             }, Modifier.weight(1f).padding(3.dp)) { Text("Pair") }
         }
