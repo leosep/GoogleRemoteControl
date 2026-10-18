@@ -38,6 +38,7 @@ fun App(r: TvRemote, act: Activity) {
     var text by remember { mutableStateOf("") }
     var scanning by remember { mutableStateOf(false) }
     val found = remember { mutableStateListOf<Pair<String, String>>() }
+    val logs = remember { mutableStateListOf<String>() }
     fun ui(b: () -> Unit) = act.runOnUiThread(b)
 
     fun startScan() {
@@ -48,6 +49,7 @@ fun App(r: TvRemote, act: Activity) {
 
     LaunchedEffect(Unit) {
         r.onStatus = { s -> ui { status = s } }
+        r.onLog = { m -> ui { logs.add(m); if (logs.size > 60) logs.removeAt(0) } }
         startScan()
         if (host.isNotBlank()) r.connect(host)
     }
@@ -107,6 +109,7 @@ fun App(r: TvRemote, act: Activity) {
             OutlinedTextField(code, { code = it }, label = { Text("TV code") }, singleLine = true, modifier = Modifier.weight(1f))
             Button({ fut?.complete(code); code = "" }, Modifier.padding(start = 8.dp)) { Text("OK") }
         }
+        TextButton({ r.resetPairing(); status = "Pairing reset. Tap Pair again." }) { Text("Reset pairing") }
         Spacer(Modifier.height(12.dp))
         Row { Spacer(Modifier.weight(1f)); Btn(r, "▲", K.UP); Spacer(Modifier.weight(1f)) }
         Row { Btn(r, "◀", K.LEFT); Btn(r, "OK", K.OK); Btn(r, "▶", K.RIGHT) }
@@ -125,5 +128,16 @@ fun App(r: TvRemote, act: Activity) {
             Button({ r.type(text); text = "" }, Modifier.padding(start = 8.dp)) { Text("Send") }
         }
         Row { Btn(r, "Delete", K.DEL); Btn(r, "Enter", K.ENTER) }
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Diagnostics", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            TextButton({ logs.clear() }) { Text("Clear") }
+        }
+        Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = MaterialTheme.shapes.small, modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(8.dp)) {
+                if (logs.isEmpty()) Text("—", style = MaterialTheme.typography.bodySmall)
+                logs.takeLast(20).forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+            }
+        }
     }
 }

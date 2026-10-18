@@ -3,6 +3,7 @@ package com.leosep.googleremotecontrol
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.util.Log
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
@@ -18,6 +19,8 @@ import java.net.Socket
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.Principal
+import java.security.PrivateKey
 import java.security.cert.X509Certificate
 import java.security.interfaces.RSAPublicKey
 import java.util.Date
@@ -25,6 +28,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.*
+
+private const val TAG = "GoogleRemoteControl"
 
 /** Minimal hand-written protobuf (only what is needed). */
 object Pb {
@@ -89,6 +94,8 @@ object K {
 
 class TvRemote(private val ctx: Context) {
     var onStatus: (String) -> Unit = {}
+    var onLog: (String) -> Unit = {}
+    private fun log(msg: String) { Log.i(TAG, msg); onLog(msg) }
     @Volatile private var sock: SSLSocket? = null
     @Volatile private var gen = 0
     @Volatile private var scanGen = 0
@@ -112,33 +119,52 @@ class TvRemote(private val ctx: Context) {
         return ks
     }
 
-    private fun socket(host: String, port: Int): SSLSocket {
-        val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply { init(keyStore(), pw) }
+    private fun makeContext(managers: Array<KeyManager>): SSLContext {
         // The TV presents a self-signed certificate during pairing, so all certs must be accepted.
         val trustAll = object : X509TrustManager {
             override fun checkClientTrusted(c: Array<X509Certificate>?, a: String?) {}
             override fun checkServerTrusted(c: Array<X509Certificate>?, a: String?) {}
             override fun getAcceptedIssuers() = arrayOf<X509Certificate>()
         }
-        val sc = SSLContext.getInstance("TLS").apply { init(kmf.keyManagers, arrayOf(trustAll), null) }
-        fun open(protocols: Array<String>?): SSLSocket {
-            val s = sc.socketFactory.createSocket() as SSLSocket
-            if (protocols != null) s.enabledProtocols = protocols
-            s.connect(InetSocketAddress(host, port), 5000)
-            s.soTimeout = 0
-            return s
+        return SSLContext.getInstance("TLS").apply { init(managers, arrayOf(trustAll), null) }
+    }
+
+    /**
+     * Opens a TLS socket. Different Android TV vendors have different TLS quirks, so several
+     * strategies are tried in order until one handshake succeeds:
+     *   1. always present our client certificate (needed by Sony/Philips/TCL), TLS 1.2
+     *   2. always present our client certificate, platform default protocols
+     *   3. default key manager, TLS 1.2  (works on Chromecast / Google TV)
+     *   4. default key manager, platform default protocols
+     */
+    private fun socket(host: String, port: Int): SSLSocket {
+        val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply { init(keyStore(), pw) }
+        val base = kmf.keyManagers.filterIsInstance<X509ExtendedKeyManager>().firstOrNull()
+        val candidates = ArrayList<Array<KeyManager>>()
+        if (base != null) candidates.add(arrayOf(PinnedKeyManager(base, "k")))
+        candidates.add(kmf.keyManagers)
+        val protocolSets = listOf<Array<String>?>(arrayOf("TLSv1.2"), null)
+        var last: Exception? = null
+        for (managers in candidates) {
+            val sc = makeContext(managers)
+            for (protocols in protocolSets) {
+                var s: SSLSocket? = null
+                try {
+                    s = sc.socketFactory.createSocket() as SSLSocket
+                    if (protocols != null) s.enabledProtocols = protocols
+                    s.connect(InetSocketAddress(host, port), 5000)
+                    s.soTimeout = 0
+                    s.startHandshake()
+                    log("Handshake OK to $host:$port proto=${s.session.protocol} cipher=${s.session.cipherSuite} pinned=${managers[0] is PinnedKeyManager}")
+                    return s
+                } catch (e: Exception) {
+                    last = e
+                    log("Handshake failed (pinned=${managers[0] is PinnedKeyManager}, tls12=${protocols != null}): ${e.javaClass.simpleName}: ${e.message}")
+                    try { s?.close() } catch (_: Exception) {}
+                }
+            }
         }
-        // The Android TV Remote Service only speaks TLS 1.2, but fall back to the platform default if needed.
-        val s = open(arrayOf("TLSv1.2"))
-        try {
-            s.startHandshake()
-            return s
-        } catch (e: SSLException) {
-            try { s.close() } catch (_: Exception) {}
-            val s2 = open(null)
-            s2.startHandshake()
-            return s2
-        }
+        throw last ?: SSLException("TLS handshake failed")
     }
 
     /** Turns low-level network/SSL exceptions into messages a user can act on. */
@@ -154,38 +180,39 @@ class TvRemote(private val ctx: Context) {
 
     /** Pairing (blocking). askCode must return the 6-character code shown on the TV. */
     fun pair(host: String, askCode: () -> String, status: (String) -> Unit) {
-        status("Contacting TV…")
+        status("Contacting TV…"); log("Pairing with $host:6467")
         val s = socket(host, 6467); val i = s.inputStream; val o = s.outputStream
         fun tx(p: ByteArray) { o.write(Pb.frame(Pb.int(1, 2) + Pb.int(2, 200) + p)); o.flush() }
-        val enc = Pb.int(1, 3) + Pb.int(2, 4) // hexadecimal, 4 symbols
-        tx(Pb.bytes(10, Pb.str(1, "androidtv-remote") + Pb.str(2, "GoogleRemoteControl"))); Pb.read(i)
+        val enc = Pb.int(1, 3) + Pb.int(2, 6) // HEXADECIMAL, 6 symbols (this is what makes the TV show the code)
+        tx(Pb.bytes(10, Pb.str(1, "atvremote") + Pb.str(2, "GoogleRemoteControl"))); Pb.read(i)
         tx(Pb.bytes(20, Pb.bytes(1, enc) + Pb.int(3, 1))); Pb.read(i)
         tx(Pb.bytes(30, Pb.bytes(1, enc) + Pb.int(2, 1))); Pb.read(i)
-        status("Enter the code shown on the TV")
+        status("Enter the code shown on the TV"); log("Awaiting pairing code")
         val raw = askCode().trim().uppercase()
         if (raw.length != 6) error("The code must be 6 characters")
-        val hex = raw.substring(2)
-        if (!hex.all { it in "0123456789ABCDEF" }) error("Invalid code")
+        if (!raw.all { it in "0123456789ABCDEF" }) error("Invalid code")
         val mine = keyStore().getCertificate("k").publicKey as RSAPublicKey
         val theirs = s.session.peerCertificates[0].publicKey as RSAPublicKey
         val h = MessageDigest.getInstance("SHA-256")
         h.update(mod(mine.modulus)); h.update(mod(mine.publicExponent))
         h.update(mod(theirs.modulus)); h.update(mod(theirs.publicExponent))
-        h.update(hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray())
-        tx(Pb.bytes(40, Pb.bytes(1, h.digest())))
+        h.update(raw.substring(2).chunked(2).map { it.toInt(16).toByte() }.toByteArray())
+        val digest = h.digest()
+        if ((digest[0].toInt() and 0xFF) != raw.substring(0, 2).toInt(16)) error("Wrong code")
+        tx(Pb.bytes(40, Pb.bytes(1, digest)))
         val r = Pb.parse(Pb.read(i)); s.close()
         if ((r[2]?.firstOrNull() as? Long) != 200L) error("Wrong code")
-        status("Paired ✔")
+        status("Paired ✔"); log("Paired with $host")
     }
 
     fun connect(host: String) {
-        disconnect(); onStatus("Connecting…")
+        disconnect(); onStatus("Connecting…"); log("Connecting to $host:6466")
         val my = ++gen
         Thread {
             try {
                 val s = socket(host, 6466); sock = s; val i = s.inputStream
                 if (my != gen) { s.close(); return@Thread }
-                onStatus("Connected")
+                onStatus("Connected"); log("Connected to $host")
                 while (my == gen) {
                     val m = Pb.parse(Pb.read(i))
                     when {
@@ -200,6 +227,7 @@ class TvRemote(private val ctx: Context) {
                     }
                 }
             } catch (e: Exception) {
+                log("Connect error: ${e.javaClass.name}: ${e.message}")
                 if (my == gen) onStatus("Disconnected: ${friendlyError(e)}")
             }
         }.start()
@@ -209,6 +237,12 @@ class TvRemote(private val ctx: Context) {
         gen++
         try { sock?.close() } catch (_: Exception) {}
         sock = null
+    }
+
+    /** Deletes the stored client certificate so the next pairing starts from scratch. */
+    fun resetPairing() {
+        disconnect()
+        try { File(ctx.filesDir, "client.p12").delete() } catch (_: Exception) {}
     }
 
     private fun send(msg: ByteArray) = ex.execute {
@@ -265,31 +299,38 @@ class TvRemote(private val ctx: Context) {
             for (ni in NetworkInterface.getNetworkInterfaces()) {
                 if (!ni.isUp || ni.isLoopback) continue
                 for (ia in ni.inetAddresses) {
-                    if (ia is Inet4Address && !ia.isLoopbackAddress && ia.isSiteLocalAddress) return ia.hostAddress
+                    if (ia is Inet4Address && !ia.isLoopbackAddress && ia.isSiteLocalAddress) {
+                        log("Local address: ${ia.hostAddress} on ${ni.name}")
+                        return ia.hostAddress
+                    }
                 }
             }
         } catch (_: Exception) {}
+        log("No local IPv4 address found")
         return null
     }
 
     private fun scanSubnet(g: Int, onDevice: (String, String) -> Unit) {
         val own = localIpv4() ?: return
         val base = own.substringBeforeLast('.')
+        log("Scanning $base.0/24 on port 6466")
         val pool = Executors.newFixedThreadPool(48)
         val latch = CountDownLatch(254)
+        val hits = java.util.concurrent.atomic.AtomicInteger()
         for (i in 1..254) {
             val target = "$base.$i"
             pool.execute {
                 try {
                     if (target != own && g == scanGen) {
                         Socket().use { it.connect(InetSocketAddress(target, 6466), 400) }
-                        if (g == scanGen) onDevice("Android TV", target)
+                        if (g == scanGen) { hits.incrementAndGet(); log("Found device at $target"); onDevice("Android TV", target) }
                     }
                 } catch (_: Exception) {} finally { latch.countDown() }
             }
         }
         latch.await(20, TimeUnit.SECONDS)
         pool.shutdownNow()
+        log("Scan finished, ${hits.get()} device(s) found")
     }
 
     fun stopDiscovery() {
@@ -297,4 +338,20 @@ class TvRemote(private val ctx: Context) {
         try { listener?.let { discovery?.stopServiceDiscovery(it) } } catch (_: Exception) {}
         listener = null
     }
+}
+
+/** Always presents the given client certificate, ignoring the server's CA list. */
+private class PinnedKeyManager(private val delegate: X509ExtendedKeyManager, private val alias: String) : X509ExtendedKeyManager() {
+    private fun isRsa(keyType: Array<out String>?) =
+        keyType == null || keyType.isEmpty() || keyType.any { it.contains("RSA", ignoreCase = true) }
+
+    override fun chooseClientAlias(keyType: Array<out String>?, issuers: Array<out Principal>?, socket: Socket?): String? =
+        if (isRsa(keyType)) alias else delegate.chooseClientAlias(keyType, issuers, socket)
+    override fun chooseEngineClientAlias(keyType: Array<out String>?, issuers: Array<out Principal>?, engine: SSLEngine?): String? =
+        if (isRsa(keyType)) alias else delegate.chooseEngineClientAlias(keyType, issuers, engine)
+    override fun getClientAliases(keyType: String?, issuers: Array<out Principal>?): Array<String> = arrayOf(alias)
+    override fun chooseServerAlias(keyType: String?, issuers: Array<out Principal>?, socket: Socket?): String? = delegate.chooseServerAlias(keyType, issuers, socket)
+    override fun getServerAliases(keyType: String?, issuers: Array<out Principal>?): Array<String>? = delegate.getServerAliases(keyType, issuers)
+    override fun getCertificateChain(alias: String?): Array<X509Certificate>? = delegate.getCertificateChain(alias)
+    override fun getPrivateKey(alias: String?): PrivateKey? = delegate.getPrivateKey(alias)
 }
