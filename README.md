@@ -4,6 +4,10 @@ An open-source Android remote control for **Google TV / Android TV** devices, wr
 
 It talks to the TV directly over the local network using the official Android TV Remote Service v2 protocol (TLS on ports `6466`/`6467`), the same protocol used by the Google TV mobile app. No account, no cloud, no ads.
 
+## Download
+
+Grab the latest APK from the [**Releases page**](https://github.com/leosep/GoogleRemoteControl/releases/latest), copy it to your phone and open it to install.
+
 ## Features
 
 - Automatic TV discovery on the local network (NSD / mDNS).
