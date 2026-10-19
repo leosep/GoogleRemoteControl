@@ -99,6 +99,10 @@ class TvRemote(private val ctx: Context) {
     @Volatile private var sock: SSLSocket? = null
     @Volatile private var gen = 0
     @Volatile private var scanGen = 0
+    @Volatile private var connected = false
+    @Volatile private var connecting = false
+    @Volatile var lastHost: String? = null
+    private val pending = java.util.Collections.synchronizedList(ArrayList<ByteArray>())
     private var discovery: NsdManager? = null
     private var listener: NsdManager.DiscoveryListener? = null
     private val ex = Executors.newSingleThreadExecutor()
@@ -206,37 +210,75 @@ class TvRemote(private val ctx: Context) {
     }
 
     fun connect(host: String) {
-        disconnect(); onStatus("Connecting…"); log("Connecting to $host:6466")
+        lastHost = host
+        val wasConnected = connected
+        disconnect()
+        onStatus(if (wasConnected) "Reconnecting…" else "Connecting…")
+        log("Connecting to $host:6466")
         val my = ++gen
+        connecting = true
         Thread {
             try {
-                val s = socket(host, 6466); sock = s; val i = s.inputStream
-                if (my != gen) { s.close(); return@Thread }
+                val s = socket(host, 6466)
+                if (my != gen) { try { s.close() } catch (_: Exception) {}; return@Thread }
+                sock = s; connected = true; connecting = false
+                val i = s.inputStream
                 onStatus("Connected"); log("Connected to $host")
+                flushPending()
                 while (my == gen) {
                     val m = Pb.parse(Pb.read(i))
                     when {
-                        m.containsKey(1) -> send(Pb.bytes(1, Pb.int(1, 622) + Pb.bytes(2,
+                        m.containsKey(1) -> rawSend(Pb.bytes(1, Pb.int(1, 622) + Pb.bytes(2,
                             Pb.str(1, "GoogleRemoteControl") + Pb.str(2, "GoogleRemoteControl") + Pb.int(3, 1) + Pb.str(4, "1") +
                                 Pb.str(5, "androidtv.remote") + Pb.str(6, "1.0.0"))))
-                        m.containsKey(2) -> send(Pb.bytes(2, Pb.int(1, 622)))
+                        m.containsKey(2) -> rawSend(Pb.bytes(2, Pb.int(1, 622)))
                         m.containsKey(8) -> {
                             val v = Pb.parse(m[8]!![0] as ByteArray)[1]?.firstOrNull() as? Long ?: 0L
-                            send(Pb.bytes(9, Pb.int(1, v.toInt())))
+                            rawSend(Pb.bytes(9, Pb.int(1, v.toInt())))
                         }
                     }
                 }
             } catch (e: Exception) {
-                log("Connect error: ${e.javaClass.name}: ${e.message}")
-                if (my == gen) onStatus("Disconnected: ${friendlyError(e)}")
+                if (my == gen) {
+                    connected = false; connecting = false
+                    log("Connect error: ${e.javaClass.name}: ${e.message}")
+                    onStatus("Disconnected: ${friendlyError(e)}")
+                }
             }
         }.start()
     }
 
     fun disconnect() {
         gen++
+        connected = false
+        connecting = false
         try { sock?.close() } catch (_: Exception) {}
         sock = null
+    }
+
+    /** Reconnects to the last device if currently disconnected (used when the app resumes). */
+    fun reconnectIfNeeded(savedHost: String? = null) {
+        if (savedHost != null && lastHost == null) lastHost = savedHost
+        if (!connected && !connecting) ensureConnected()
+    }
+
+    private fun ensureConnected() {
+        val host = lastHost ?: return
+        if (!connected && !connecting) connect(host)
+    }
+
+    private fun queue(msg: ByteArray) {
+        synchronized(pending) {
+            pending.add(msg)
+            while (pending.size > 40) pending.removeAt(0)
+        }
+    }
+
+    private fun flushPending() {
+        val copy = synchronized(pending) { val c = pending.toList(); pending.clear(); c }
+        copy.forEach { msg -> ex.execute {
+            try { sock?.outputStream?.apply { write(Pb.frame(msg)); flush() } } catch (_: Exception) {}
+        } }
     }
 
     /** Deletes the stored client certificate so the next pairing starts from scratch. */
@@ -245,8 +287,28 @@ class TvRemote(private val ctx: Context) {
         try { File(ctx.filesDir, "client.p12").delete() } catch (_: Exception) {}
     }
 
-    private fun send(msg: ByteArray) = ex.execute {
+    private fun rawSend(msg: ByteArray) = ex.execute {
         try { sock?.outputStream?.apply { write(Pb.frame(msg)); flush() } } catch (_: Exception) {}
+    }
+
+    /**
+     * Sends a command. If the TV is not connected (e.g. the idle connection was dropped),
+     * it reconnects to the last device and flushes the queued command afterwards.
+     */
+    private fun send(msg: ByteArray) {
+        if (connected && sock != null) {
+            ex.execute {
+                try { sock?.outputStream?.apply { write(Pb.frame(msg)); flush() } }
+                catch (_: Exception) {
+                    connected = false
+                    queue(msg)
+                    ensureConnected()
+                }
+            }
+        } else {
+            queue(msg)
+            ensureConnected()
+        }
     }
     fun key(code: Int) = send(Pb.bytes(10, Pb.int(1, code) + Pb.int(2, 3))) // 3 = short press
     fun type(t: String) = t.forEach { c -> K.forChar(c)?.let { key(it) } }

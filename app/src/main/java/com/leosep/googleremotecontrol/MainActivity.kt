@@ -16,10 +16,18 @@ import java.util.concurrent.CompletableFuture
 
 class MainActivity : ComponentActivity() {
     private lateinit var remote: TvRemote
+    private var resumedOnce = false
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         remote = TvRemote(this)
         setContent { MaterialTheme(colorScheme = darkColorScheme()) { Surface(Modifier.fillMaxSize()) { App(remote, this) } } }
+    }
+    override fun onResume() {
+        super.onResume()
+        if (resumedOnce) {
+            val saved = getSharedPreferences("p", 0).getString("host", "") ?: ""
+            if (saved.isNotBlank()) remote.reconnectIfNeeded(saved)
+        } else resumedOnce = true
     }
     override fun onDestroy() { remote.disconnect(); super.onDestroy() }
 }
